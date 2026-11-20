@@ -1,6 +1,7 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <EEPROM.h>
+#include <avr/io.h>
 
 // ==========================
 // LCD 20x4
@@ -15,6 +16,17 @@ LiquidCrystal_I2C lcd(0x3F, 20, 4);
 #define ENC_CLK 4
 #define ENC_DT  5
 #define ENC_SW  6
+
+// ==========================
+// LIN TEST TRANSMITTER
+// ==========================
+
+#define LIN_TX_PIN 1
+
+const uint8_t LIN_PID = 0x92;
+const unsigned long LIN_INTERVAL = 500;
+
+unsigned long lastLinFrame = 0;
 
 // ==========================
 // POWER
@@ -85,11 +97,104 @@ struct SavedSettings {
 };
 
 bool settingsSavePending = false;
-
 unsigned long lastSettingsChange = 0;
 
 const unsigned long EEPROM_SAVE_DELAY = 1500;
 
+// ==========================
+// LIN CHECKSUM
+// Enhanced checksum
+// ==========================
+
+uint8_t calculateLINChecksum(uint8_t pid,
+                             uint8_t data0,
+                             uint8_t data1,
+                             uint8_t data2) {
+
+  uint16_t sum = pid;
+
+  sum += data0;
+  sum += data1;
+  sum += data2;
+
+  while (sum > 0xFF) {
+    sum = (sum & 0xFF) + (sum >> 8);
+  }
+
+  return (uint8_t)(~sum);
+}
+
+// ==========================
+// LIN BREAK
+// ==========================
+
+void sendLINBreak() {
+
+  Serial.flush();
+
+  UCSR0B &= ~_BV(TXEN0);
+
+  pinMode(LIN_TX_PIN, OUTPUT);
+
+  digitalWrite(LIN_TX_PIN, LOW);
+  delayMicroseconds(1500);
+
+  digitalWrite(LIN_TX_PIN, HIGH);
+  delayMicroseconds(200);
+
+  UCSR0B |= _BV(TXEN0);
+}
+
+// ==========================
+// ОТПРАВКА LIN КАДРА
+// ==========================
+
+void sendLINFrame() {
+
+  // POWER передаём числом от 0 до 100
+  uint8_t data0 = (uint8_t)powerValue;
+
+  // Пока тестовые байты
+  uint8_t data1 = 0x02;
+  uint8_t data2 = 0x03;
+
+  uint8_t checksum = calculateLINChecksum(
+    LIN_PID,
+    data0,
+    data1,
+    data2
+  );
+
+  sendLINBreak();
+
+  Serial.write(0x55);       // SYNC
+  Serial.write(LIN_PID);    // PID
+  Serial.write(data0);      // POWER
+  Serial.write(data1);      // TEST DATA
+  Serial.write(data2);      // TEST DATA
+  Serial.write(checksum);   // CHECKSUM
+
+  Serial.flush();
+}
+
+// ==========================
+// ОБРАБОТКА LIN
+// ==========================
+
+void processLIN() {
+
+  // В AUTO передача отключена
+  if (workMode != BENCH_MODE) {
+    return;
+  }
+
+  if (millis() - lastLinFrame >= LIN_INTERVAL) {
+
+    lastLinFrame = millis();
+
+    sendLINFrame();
+  }
+}
 
 // ==========================
 // ЗАГРУЗКА НАСТРОЕК
@@ -113,10 +218,8 @@ void loadSettings() {
 
     powerValue = 0;
     workMode = AUTO_MODE;
-
   }
 }
-
 
 // ==========================
 // СОХРАНЕНИЕ НАСТРОЕК
@@ -135,7 +238,6 @@ void saveSettings() {
   settingsSavePending = false;
 }
 
-
 // ==========================
 // ЗАПЛАНИРОВАТЬ СОХРАНЕНИЕ
 // ==========================
@@ -144,9 +246,7 @@ void scheduleSave() {
 
   settingsSavePending = true;
   lastSettingsChange = millis();
-
 }
-
 
 // ==========================
 // ПРОВЕРКА СОХРАНЕНИЯ
@@ -158,10 +258,8 @@ void processEEPROM() {
       millis() - lastSettingsChange >= EEPROM_SAVE_DELAY) {
 
     saveSettings();
-
   }
 }
-
 
 // ==========================
 // SETUP
@@ -180,9 +278,16 @@ void setup() {
 
   loadSettings();
 
+  // UART для тестовой LIN-передачи на D1
+  Serial.begin(9600);
+
+  pinMode(LIN_TX_PIN, OUTPUT);
+  digitalWrite(LIN_TX_PIN, HIGH);
+
+  lastLinFrame = millis();
+
   showMainMenu();
 }
-
 
 // ==========================
 // ГЛАВНЫЙ ЦИКЛ
@@ -194,15 +299,14 @@ void loop() {
   readButton();
 
   processEEPROM();
+  processLIN();
 
   if (screenChanged) {
 
     screenChanged = false;
     updateScreen();
-
   }
 }
-
 
 // ==========================
 // ЧТЕНИЕ ЭНКОДЕРА
@@ -225,7 +329,6 @@ void readEncoder() {
 
   lastCLK = currentCLK;
 }
-
 
 // ==========================
 // ОБРАБОТКА ВРАЩЕНИЯ
@@ -282,12 +385,12 @@ void handleEncoder() {
 
     if (workMode != oldMode) {
       scheduleSave();
+      lastLinFrame = millis();
     }
 
     screenChanged = true;
   }
 }
-
 
 // ==========================
 // ЧТЕНИЕ КНОПКИ
@@ -323,7 +426,6 @@ void readButton() {
   buttonLastState = buttonState;
 }
 
-
 // ==========================
 // КОРОТКОЕ НАЖАТИЕ
 // ==========================
@@ -353,7 +455,6 @@ void shortPress() {
   screenChanged = true;
 }
 
-
 // ==========================
 // ДОЛГОЕ НАЖАТИЕ
 // ==========================
@@ -366,7 +467,6 @@ void goBack() {
 
   screenChanged = true;
 }
-
 
 // ==========================
 // ОБНОВЛЕНИЕ ЭКРАНА
@@ -393,7 +493,6 @@ void updateScreen() {
       break;
   }
 }
-
 
 // ==========================
 // ГЛАВНОЕ МЕНЮ
@@ -422,7 +521,6 @@ void showMainMenu() {
   printMode();
 }
 
-
 // ==========================
 // ЭКРАН POWER
 // ==========================
@@ -444,7 +542,6 @@ void showPower() {
   lcd.print("ROTATE: CHANGE");
 }
 
-
 // ==========================
 // ЭКРАН GENERATOR
 // ==========================
@@ -462,7 +559,6 @@ void showGenerator() {
   lcd.setCursor(0, 3);
   lcd.print("HOLD: BACK");
 }
-
 
 // ==========================
 // ЭКРАН MODE
@@ -487,7 +583,6 @@ void showMode() {
   lcd.print("ROTATE: CHANGE");
 }
 
-
 // ==========================
 // ВЫВОД POWER
 // ==========================
@@ -499,7 +594,6 @@ void printPower() {
 
   lcd.print(powerValue);
 }
-
 
 // ==========================
 // ВЫВОД РЕЖИМА
